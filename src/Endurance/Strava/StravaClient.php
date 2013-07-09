@@ -4,14 +4,17 @@ namespace Endurance\Strava;
 
 use Buzz\Browser;
 use Buzz\Message\Form\FormRequest;
+use Buzz\Message\Form\FormUpload;
 use Buzz\Message\Request;
 use Buzz\Message\Response;
 use Buzz\Util\Url;
+use Symfony\Component\CssSelector\CssSelector;
+use Symfony\Component\DomCrawler\Crawler;
 
 class StravaClient
 {
     protected $browser;
-    protected $token;
+    protected $authenticityToken;
 
     public function __construct(Browser $browser)
     {
@@ -20,37 +23,43 @@ class StravaClient
         // Set client options
         $client = $this->browser->getClient();
 
+        // Don't follow redirects (important for asserting we signed in)
+        $client->setOption(CURLOPT_FOLLOWLOCATION, false);
+
+        // Initialise the cookie jar
+        $cookieFile = tempnam('/tmp', 'StravaClient');
+        $client->setOption(CURLOPT_COOKIEJAR, $cookieFile);
+        $client->setOption(CURLOPT_COOKIEFILE, $cookieFile);
+
         // Remove the timeout to allow time to download large files
         $client->setTimeout(0);
     }
 
-    public function signIn($email, $password)
+    public function signIn($username, $password)
     {
-        $request = new FormRequest(FormRequest::METHOD_POST);
+        // Load the login page to get the authenticity token
+        $response = $this->browser->get('https://www.strava.com/login');
+        $crawler = new Crawler($response->getContent());
+        $authenticityToken = $crawler->filterXPath(CssSelector::toXPath('input[name=authenticity_token]'))->attr('value');
 
-        // Set the request URL
-        $url = new Url('https://www.strava.com/api/v2/authentication/login');
-        $url->applyToRequest($request);
+        // Post the login form
+        $response = $this->browser->post('https://www.strava.com/session', array(), http_build_query(array(
+            'authenticity_token' => $authenticityToken,
+            'email' => $username,
+            'password' => $password
+        )));
 
-        // Set the form fields
-        $request->setField('email', $email);
-        $request->setField('password', $password);
+        // Get the new authenticity token
+        $response = $this->browser->get('http://app.strava.com/upload/select');
+        $crawler = new Crawler($response->getContent());
+        $authenticityToken = $crawler->filterXPath(CssSelector::toXPath('meta[name=csrf-token]'))->attr('content');
 
-        $response = new Response();
-        $this->browser->getClient()->send($request, $response);
-
-        $result = json_decode($response->getContent(), true);
-
-        if (!isset($result['token'])) {
-            throw new \RuntimeException('Unable to sign in');
-        }
-
-        $this->token = $result['token'];
+        $this->authenticityToken = $authenticityToken;
     }
 
     public function isSignedIn()
     {
-        return $this->token !== null;
+        return $this->authenticityToken !== null;
     }
 
     public function uploadActivity($file)
@@ -59,40 +68,50 @@ class StravaClient
             throw new \RuntimeException('Not signed in');
         }
 
-        $request = new FormRequest(FormRequest::METHOD_POST);
+        $request = new Request(Request::METHOD_POST);
 
         // Set the request URL
-        $url = new Url('http://www.strava.com/api/v2/upload');
+        $url = new Url('http://app.strava.com/upload/files');
         $url->applyToRequest($request);
 
-        // Set the form fields
-        $request->setField('token', $this->token);
-        $request->setField('type', 'fit');
+        // Manually build POST data due to a bug in Buzz
+        // that means the file upload field name cannot contain "[]"
+        $boundary = sha1(rand(11111, 99999) . time() . uniqid());
 
-        // Not using FormUpload as the Strava API expects the data as a field value
-        $request->setField('data', file_get_contents($file));
+        $content = '';
+        $content .= '--' . $boundary . "\r\n";
+        $content .= "Content-Disposition: form-data; name=\"_method\"\r\n";
+        $content .= "\r\n";
+        $content .= "post\r\n";
+        $content .= '--' . $boundary . "\r\n";
+        $content .= "Content-Disposition: form-data; name=\"new_uploader\"\r\n";
+        $content .= "\r\n";
+        $content .= "1\r\n";
+        $content .= '--' . $boundary . "\r\n";
+        $content .= "Content-Disposition: form-data; name=\"authenticity_token\"\r\n";
+        $content .= "\r\n";
+        $content .= $this->authenticityToken . "\r\n";
+        $content .= '--' . $boundary . "\r\n";
+        $content .= "Content-Disposition: form-data; name=\"files[]\"; filename=\"" . basename($file) . "\"\r\n";
+        $content .= "Content-Type: application/octet-stream\r\n";
+        $content .= "\r\n";
+        $content .= file_get_contents($file) . "\r\n";
+        $content .= '--' . $boundary . '--';
+
+        $request->setContent($content);
+
+        // Set required headers
+        $request->setHeaders(array(
+            'X-CSRF-Token:' . $this->authenticityToken,
+            'X-Requested-With:XMLHttpRequest',
+            // Buzz attempts to remove this header.
+            // It only works due to a bug in Buzz where the header is only stripped if there is a space after the ":".
+            'Content-Type:multipart/form-data; boundary='. $boundary
+        ));
+
 
         $response = new Response();
         $this->browser->getClient()->send($request, $response);
-
-        return json_decode($response->getContent(), true);
-    }
-
-    public function getMap($rideId)
-    {
-        if (!$this->isSignedIn()) {
-            throw new \RuntimeException('Not signed in');
-        }
-
-        $response = $this->browser->get("http://www.strava.com/api/v2/rides/$rideId/map_details?token={$this->token}");
-
-        return json_decode($response->getContent(), true);
-    }
-
-    public function getRideDetails($rideId)
-    {
-        // Doesn't require authentication
-        $response = $this->browser->get("http://www.strava.com/api/v2/rides/$rideId");
 
         return json_decode($response->getContent(), true);
     }
